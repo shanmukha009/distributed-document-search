@@ -1,0 +1,76 @@
+services:
+  # Elasticsearch — Search Engine
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.1
+    container_name: doc-search-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q 'yellow\\|green'"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Redis — Caching Layer
+  redis:
+    image: redis:7.4-alpine
+    container_name: doc-search-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL — Metadata Store
+  postgres:
+    image: postgres:15-alpine
+    container_name: doc-search-postgres
+    environment:
+      POSTGRES_USER: docsearch
+      POSTGRES_PASSWORD: docsearch_password
+      POSTGRES_DB: documents_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docsearch"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Our FastAPI Application
+  api:
+    build: .
+    container_name: doc-search-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://docsearch:docsearch_password@postgres:5432/documents_db
+      - LOG_LEVEL=INFO
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+
+volumes:
+  es_data:
+  redis_data:
+  postgres_data:

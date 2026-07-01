@@ -1354,15 +1354,15 @@ def collect_analytics(tenant_id: str, event: str, metadata: dict):
 
 Every code path that touches tenant data must pass this checklist:
 
-- ✅ tenant_id required in function signature
-- ✅ Elasticsearch index scoped to tenant
-- ✅ PostgreSQL RLS active for connection
-- ✅ Redis keys namespaced with tenant_id
-- ✅ Logs include tenant_id for audit
-- ✅ Cache keys include tenant_id
-- ✅ Rate limits applied per tenant
-- ✅ Error messages don't leak other tenants' data
-- ✅ Unit tests verify cross-tenant isolation
+-  tenant_id required in function signature
+-  Elasticsearch index scoped to tenant
+-  PostgreSQL RLS active for connection
+-  Redis keys namespaced with tenant_id
+-  Logs include tenant_id for audit
+-  Cache keys include tenant_id
+-  Rate limits applied per tenant
+-  Error messages don't leak other tenants' data
+-  Unit tests verify cross-tenant isolation
 
 **Automated test example:**
 ```python
