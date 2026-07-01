@@ -1,0 +1,153 @@
+# Architecture Design Document
+## Distributed Document Search Service
+
+**Author:** Shanmukha Raj  
+**Date:** July 2026  
+**Version:** 1.0  
+
+---
+
+## 1. Overview
+
+This document outlines the architecture of a **Distributed Document Search Service** designed to search through **10+ million documents** across multiple tenants with **sub-500ms response times** at the 95th percentile.
+
+The system is designed to demonstrate enterprise-grade patterns including:
+- **Multi-tenancy** with strict data isolation
+- **Horizontal scalability** to handle growing document volumes
+- **Fault tolerance** through redundancy and graceful degradation
+- **High throughput** supporting 1000+ concurrent searches per second
+
+---
+
+## 2. System Requirements
+
+### 2.1 Functional Requirements
+- Index new documents via REST API
+- Search documents with full-text search and relevance ranking
+- Retrieve document details by ID
+- Delete documents by ID
+- Enforce tenant isolation for all operations
+
+### 2.2 Non-Functional Requirements
+| Requirement | Target |
+|---|---|
+| Document volume | 10+ million |
+| Search latency (p95) | < 500ms |
+| Throughput | 1000+ concurrent searches/sec |
+| Availability | 99.95% |
+| Multi-tenancy | Strict data isolation |
+| Scalability | Horizontal (scale-out) |
+
+### 2.3 Assumptions
+- Documents are text-based (contracts, reports, articles, emails)
+- Average document size: 10KB - 100KB
+- Read-heavy workload (100 searches : 1 upload)
+- Tenants are enterprise customers with 10K - 1M documents each
+
+---
+## 3. High-Level System Architecture
+
+The system follows a **layered microservices architecture** with clear separation of concerns. Each layer can be scaled independently based on load.
+
+### 3.1 Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        C1[Web App]
+        C2[Mobile App]
+        C3[Enterprise Systems]
+    end
+
+    subgraph "Load Balancer"
+        LB[Nginx Load Balancer<br/>SSL Termination + Rate Limiting]
+    end
+
+    subgraph "Application Layer - Stateless"
+        API1[FastAPI Instance 1]
+        API2[FastAPI Instance 2]
+        API3[FastAPI Instance N]
+    end
+
+    subgraph "Caching Layer"
+        REDIS[Redis Cluster<br/>Query Results + Session Cache]
+    end
+
+    subgraph "Search Layer"
+        ES1[Elasticsearch Node 1<br/>Primary Shards]
+        ES2[Elasticsearch Node 2<br/>Replica Shards]
+        ES3[Elasticsearch Node 3<br/>Replica Shards]
+    end
+
+    subgraph "Storage Layer"
+        PG[(PostgreSQL<br/>Metadata + Tenant Config)]
+    end
+
+    subgraph "Async Processing"
+        MQ[RabbitMQ<br/>Indexing Queue]
+        W1[Indexing Worker 1]
+        W2[Indexing Worker 2]
+        W3[Indexing Worker N]
+    end
+
+    C1 --> LB
+    C2 --> LB
+    C3 --> LB
+    LB --> API1
+    LB --> API2
+    LB --> API3
+    API1 --> REDIS
+    API2 --> REDIS
+    API3 --> REDIS
+    API1 --> ES1
+    API2 --> ES1
+    API3 --> ES1
+    ES1 <--> ES2
+    ES1 <--> ES3
+    API1 --> PG
+    API2 --> PG
+    API3 --> PG
+    API1 --> MQ
+    API2 --> MQ
+    API3 --> MQ
+    MQ --> W1
+    MQ --> W2
+    MQ --> W3
+    W1 --> ES1
+    W2 --> ES1
+    W3 --> ES1
+    W1 --> PG
+    W2 --> PG
+    W3 --> PG
+```
+
+### 3.2 Component Responsibilities
+
+| Component | Responsibility | Technology Choice |
+|---|---|---|
+| **Load Balancer** | Distributes traffic, SSL termination, rate limiting | Nginx |
+| **API Layer** | Request handling, validation, authentication, orchestration | FastAPI (Python) |
+| **Caching Layer** | Query result caching, session management | Redis |
+| **Search Engine** | Full-text search with relevance ranking | Elasticsearch |
+| **Metadata Store** | Source of truth for documents and tenant config | PostgreSQL |
+| **Message Queue** | Async task processing (indexing, deletion) | RabbitMQ |
+| **Workers** | Background document processing and indexing | Python (Celery) |
+
+### 3.3 Why This Architecture?
+
+**Stateless Application Layer**  
+API servers don't store state → any request can go to any instance → easy horizontal scaling. Add more instances as traffic grows.
+
+**Separation of Read and Write Paths**  
+Read path: `API → Redis → Elasticsearch` (optimized for sub-500ms search).  
+Write path: `API → RabbitMQ → Worker → Elasticsearch + PostgreSQL` (async, non-blocking).
+
+**Independent Scaling**  
+- If search traffic spikes → add more FastAPI instances and ES nodes
+- If indexing backlog grows → add more workers
+- If cache misses increase → add more Redis nodes
+
+**Fault Isolation**  
+If Redis crashes, the system falls back to Elasticsearch (slower but functional). If RabbitMQ crashes, uploads queue up but existing searches continue.
+
+---
