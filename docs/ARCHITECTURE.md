@@ -1381,3 +1381,187 @@ def test_tenant_isolation():
 ```
 
 ---
+
+## 10. Consistency Model and Trade-offs
+
+Distributed systems force explicit trade-offs between consistency, availability, and performance. This section documents the consistency model, trade-offs made, and the reasoning behind each decision.
+
+### 10.1 Consistency Requirements by Data Type
+
+Not all data requires the same consistency guarantees. The system uses different models for different data types:
+
+| Data Type | Consistency Model | Rationale |
+|---|---|---|
+| Document metadata (PostgreSQL) | **Strong consistency** | Cannot allow duplicate document IDs or orphaned references |
+| Tenant configuration | **Strong consistency** | Auth, billing, and quotas must be exact |
+| Search index (Elasticsearch) | **Eventual consistency** | Users tolerate 1-5s delay for newly uploaded documents |
+| Search results cache (Redis) | **Eventual consistency** | Cache is a performance optimization, not source of truth |
+| Rate limit counters (Redis) | **Eventual consistency** | Occasional over/undercount is acceptable |
+| Analytics (batch pipeline) | **Eventual consistency** | Real-time not required |
+
+### 10.2 CAP Theorem Positioning
+
+For each component, the system makes an explicit CAP trade-off:
+
+| Component | CAP Choice | Behavior During Partition |
+|---|---|---|
+| PostgreSQL | **CP** | Reject writes during partition, prevent data loss |
+| Elasticsearch | **AP** | Accept writes to available nodes, reconcile later |
+| Redis (Cluster mode) | **AP** | Serve reads from available nodes, accept minor staleness |
+| RabbitMQ | **CP** (with mirrored queues) | Queue may be unavailable, but messages not lost |
+
+**Design principle:** Choose CP for data integrity, AP for user experience.
+
+### 10.3 Eventual Consistency in Search
+
+**The Reality:** When a document is uploaded, there's a delay before it's searchable.
+
+**Timeline of Consistency:**
+```
+T+0ms:    API returns 202 Accepted (document accepted)
+T+50ms:   Message published to RabbitMQ
+T+100ms:  Worker picks up message
+T+1000ms: Worker extracts text, tokenizes
+T+2000ms: Document indexed in Elasticsearch
+T+2100ms: Elasticsearch refresh cycle completes
+T+2100ms: Document is now searchable
+```
+
+**Typical delay:** 1-5 seconds.
+
+**Why users accept this:**
+- Enterprise document workflows aren't real-time (users upload, then search hours later)
+- 202 Accepted response sets clear expectation
+- Status endpoint allows polling for completion
+- Webhook notifications for real-time apps
+
+**When strong consistency is needed:**
+For clients requiring immediate searchability, we offer a **synchronous indexing mode**:
+```http
+POST /v1/documents?sync=true
+```
+This blocks until indexed (10-100x slower), but guarantees the doc is searchable when the response returns. Use sparingly — impacts throughput.
+
+### 10.4 The Dual Write Problem
+
+**Problem:** We need to update PostgreSQL (metadata) AND Elasticsearch (search index). If one fails, data becomes inconsistent.
+
+**Naive approach (BROKEN):**
+```python
+def upload_document(doc):
+    postgres.insert(doc)      # Succeeds
+    elasticsearch.index(doc)  # Fails (network error)
+    # RESULT: PG has doc, ES doesn't → search misses this doc
+```
+
+**Our solution: Transactional Outbox Pattern**
+
+```mermaid
+graph LR
+    API[API] -->|BEGIN TRANSACTION| PG[(PostgreSQL)]
+    PG --> DOCS[documents table]
+    PG --> OUTBOX[outbox table]
+    PG -->|COMMIT| API
+    API -->|202 Accepted| Client
+    
+    OUTBOX -.->|CDC/Polling| Publisher[Outbox Publisher]
+    Publisher --> MQ[RabbitMQ]
+    MQ --> Worker[Indexing Worker]
+    Worker --> ES[(Elasticsearch)]
+```
+
+**How it works:**
+1. Single PG transaction inserts doc + outbox record
+2. Outbox record contains message to be published
+3. Background publisher reads outbox, publishes to RabbitMQ
+4. Worker consumes from RabbitMQ, indexes in ES
+5. On success, publisher marks outbox record as sent
+
+**Benefits:**
+- Atomic write (PG transaction guarantees both records or neither)
+- No dual write problem
+- Retry-safe (publisher can retry failed publications)
+- Auditable (outbox is a persistent event log)
+
+### 10.5 Read-After-Write Consistency
+
+**Problem:** User uploads a document, then immediately searches. Due to eventual consistency, the doc isn't in the index yet.
+
+**Our solutions:**
+
+#### Solution 1: Poll for Status (Recommended)
+```python
+# Client uploads
+response = POST /documents
+doc_id = response['document_id']
+
+# Client polls for completion
+while True:
+    status = GET /documents/{doc_id}
+    if status['status'] == 'indexed':
+        break
+    time.sleep(0.5)
+
+# Now search will find it
+results = GET /search?q=...
+```
+
+#### Solution 2: Webhook Notifications
+```python
+# Client provides webhook URL
+POST /documents
+{
+  "content": "...",
+  "webhook_url": "https://client.com/callbacks/indexed"
+}
+
+# Our system calls webhook when indexing completes
+```
+
+#### Solution 3: Synchronous Mode (When Needed)
+```python
+# Blocks until indexed
+POST /documents?sync=true
+# Slower but guarantees immediate searchability
+```
+
+### 10.6 Distributed Transactions and the Saga Pattern
+
+**Problem:** Some operations touch multiple systems (delete from PG + ES + cache). Traditional ACID transactions don't work across services.
+
+**Solution: Saga Pattern**
+
+A saga is a sequence of local transactions where each step has a **compensating action** for rollback.
+
+**Example: Document Deletion Saga**
+
+```mermaid
+sequenceDiagram
+    participant API
+    participant PG as PostgreSQL
+    participant ES as Elasticsearch
+    participant Redis
+    
+    API->>PG: Mark document deleted
+    PG-->>API: OK
+    API->>ES: Delete from index
+    alt ES fails
+        ES-->>API: FAILURE
+        API->>PG: COMPENSATE: Unmark deletion
+        API-->>Client: 500 Error
+    else ES succeeds
+        ES-->>API: OK
+        API->>Redis: Invalidate cache
+        alt Redis fails
+            Redis-->>API: FAILURE
+            Note over API: Log warning, don't rollback<br/>(cache eventually expires)
+        else Redis succeeds
+            Redis-->>API: OK
+        end
+        API-->>Client: 204 No Content
+    end
+```
+
+**Key insight:** Not all failures require rollback. Cache invalidation failing is OK — cache expires anyway.
+
+### 10.7
