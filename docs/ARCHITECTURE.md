@@ -636,3 +636,208 @@ X-RateLimit-Reset: 1719852600
 ```
 
 ---
+## 7. Caching Strategy
+
+Caching is critical to achieving sub-500ms response times. The system uses a **multi-layer caching approach**, with each layer optimized for different data types and access patterns.
+
+### 7.1 Caching Philosophy
+
+The system follows the **cache-aside pattern** (also called lazy loading) as the primary caching strategy:
+
+1. Check cache first
+2. On cache miss, query the underlying data store
+3. Populate cache with result
+4. Return result to client
+
+**Why cache-aside over write-through?**
+- Simpler to implement and reason about
+- Only caches actively read data (no waste)
+- Cache failures don't block writes
+- Works well with our read-heavy workload (100:1 read/write ratio)
+
+### 7.2 Multi-Layer Cache Architecture
+
+```mermaid
+graph TD
+    Client[Client Request] --> CDN[Layer 1: CDN Cache<br/>Static Assets]
+    CDN -->|Miss| Nginx[Layer 2: Nginx Cache<br/>Full Response Cache]
+    Nginx -->|Miss| Redis[Layer 3: Redis Cache<br/>Application Data]
+    Redis -->|Miss| DB[Layer 4: DB Query Cache<br/>PostgreSQL/ES]
+    DB -->|Miss| Storage[Persistent Storage]
+```
+
+### 7.3 Cache Layers Detail
+
+#### Layer 1: CDN Cache (Optional, for Enterprise)
+- **Technology:** CloudFront, Cloudflare
+- **Caches:** Static assets, downloadable document previews
+- **TTL:** 24 hours
+- **Invalidation:** On document update, purge specific URLs
+
+#### Layer 2: Nginx Response Cache
+- **Technology:** Nginx `proxy_cache`
+- **Caches:** Full HTTP responses for GET requests
+- **TTL:** 30 seconds
+- **Key:** URL + tenant_id header
+- **Use case:** Extremely hot queries repeated within seconds
+
+#### Layer 3: Redis Application Cache (Primary)
+The main caching layer where most caching logic lives. Redis handles multiple cache types with different strategies.
+
+#### Layer 4: Database Query Cache
+- **PostgreSQL:** Shared buffer cache (automatic)
+- **Elasticsearch:** Query cache and filter cache (automatic)
+- Not directly controlled by application, but influences performance
+
+### 7.4 Redis Cache Design
+
+| Cache Type | Key Pattern | TTL | Eviction | Purpose |
+|---|---|---|---|---|
+| Search Results | `search:{tenant_id}:{query_hash}` | 60s | LRU | Fast repeat searches |
+| Document Metadata | `doc:{tenant_id}:{doc_id}` | 300s | LRU | Speed up document retrieval |
+| Tenant Config | `tenant:{tenant_id}:config` | 3600s | LRU | Avoid PG hits for config |
+| Rate Limit Counters | `ratelimit:{tenant_id}:{minute}` | 60s | TTL | Enforce API rate limits |
+| Aggregations | `agg:{tenant_id}:{type}` | 900s | LRU | Cache expensive aggregations |
+| Auth Tokens | `auth:{token_hash}` | 3600s | LRU | Fast auth validation |
+
+### 7.5 Cache Key Design
+
+**Rules for cache keys:**
+
+1. **Always prefix with tenant_id** — prevents cross-tenant data leakage
+2. **Use hierarchical namespacing** — enables pattern-based invalidation
+3. **Hash long values** — keeps keys under 512 bytes
+4. **Include version prefix** — allows cache schema evolution
+
+**Example:**
+```python
+def build_search_cache_key(tenant_id: str, query: str, filters: dict) -> str:
+    query_normalized = query.lower().strip()
+    query_hash = hashlib.sha256(
+        f"{query_normalized}:{json.dumps(filters, sort_keys=True)}".encode()
+    ).hexdigest()[:16]
+    return f"v1:search:{tenant_id}:{query_hash}"
+```
+
+**Why hash the query?**
+- Long queries could exceed key size limits
+- Normalizes similar queries (e.g., extra whitespace)
+- Prevents special characters from breaking Redis
+
+### 7.6 Cache Invalidation Strategy
+
+The system uses a **hybrid invalidation approach**:
+
+#### Strategy 1: TTL-Based (Default)
+Most caches use TTL as the primary expiration mechanism. Chosen for simplicity and predictability.
+
+#### Strategy 2: Explicit Invalidation (Critical Data)
+When a document is updated or deleted:
+```python
+def invalidate_document_cache(tenant_id: str, doc_id: str):
+    # Invalidate document metadata cache
+    redis.delete(f"v1:doc:{tenant_id}:{doc_id}")
+    
+    # Invalidate all search caches for this tenant
+    # (using pattern-based scan and delete)
+    for key in redis.scan_iter(match=f"v1:search:{tenant_id}:*"):
+        redis.delete(key)
+```
+
+**Note:** Wildcard invalidation is expensive. For high-write tenants, we accept slight staleness in search results.
+
+#### Strategy 3: Event-Driven Invalidation (Cross-Instance)
+For multi-instance API deployments, we use **Redis Pub/Sub** to notify all instances of cache invalidation events:
+```
+Instance A updates doc → publishes "invalidate:doc_123" event
+Instance B, C, D receive event → delete local caches
+```
+
+### 7.7 Cache Warming Strategies
+
+**Cold Start Problem:** Right after deployment, cache is empty → all requests hit database → slow initial responses.
+
+**Solutions:**
+
+1. **Pre-warming on Startup**
+   - Background job loads top 1000 most-searched queries into cache on service start
+   - Trades startup time for consistent latency
+
+2. **Predictive Warming**
+   - Analyze search patterns nightly
+   - Pre-cache trending queries during off-peak hours
+
+3. **Refresh-Ahead for Hot Keys**
+   - Popular queries (top 100) auto-refresh 10 seconds before TTL expires
+   - Prevents "thundering herd" when popular caches expire simultaneously
+
+### 7.8 Handling Cache Failures
+
+**What happens if Redis is down?**
+
+The system implements **graceful degradation**:
+
+```python
+def get_search_results(tenant_id: str, query: str):
+    try:
+        # Try cache first
+        cached = redis_client.get(cache_key)
+        if cached:
+            return cached
+    except RedisConnectionError:
+        # Log but don't fail — Redis is optional
+        logger.warning("Redis unavailable, falling back to ES")
+    
+    # Query Elasticsearch (fallback)
+    results = elasticsearch.search(query)
+    
+    try:
+        # Try to populate cache (don't fail if this fails)
+        redis_client.setex(cache_key, 60, results)
+    except RedisConnectionError:
+        pass
+    
+    return results
+```
+
+**Behavior when Redis is down:**
+- Search still works, just slower (100ms vs 1ms)
+- No errors returned to client
+- Alerts fire to ops team
+- System auto-recovers when Redis comes back
+
+### 7.9 Cache Metrics and Monitoring
+
+Key metrics we track:
+
+| Metric | Target | Alert Threshold |
+|---|---|---|
+| Cache hit ratio (search) | > 70% | < 50% |
+| Cache hit ratio (metadata) | > 90% | < 75% |
+| Redis latency (p99) | < 5ms | > 20ms |
+| Redis memory usage | < 70% | > 85% |
+| Eviction rate | < 100/sec | > 1000/sec |
+
+**Cache hit ratio calculation:**
+```
+hit_ratio = hits / (hits + misses)
+```
+
+Low hit ratio indicates:
+- Cache too small (increase memory)
+- TTL too short (increase TTL)
+- Cache keys too specific (add normalization)
+
+### 7.10 Cost/Benefit Analysis
+
+**Cost of caching:**
+- Redis cluster: ~$500/month for 3-node cluster (32GB total)
+- Operational complexity: monitoring, tuning, failure handling
+
+**Benefit of caching:**
+- 70% cache hit ratio = 70% of queries respond in 1ms instead of 100ms
+- Reduces Elasticsearch load by 70% → smaller ES cluster needed
+- ES cluster cost savings: ~$2000/month
+- **Net benefit: ~$1500/month + better user experience**
+
+---
