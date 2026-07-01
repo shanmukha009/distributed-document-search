@@ -373,3 +373,266 @@ All tenants share the same tables but every row has a `tenant_id` column. Querie
 All Redis keys are prefixed with tenant_id (e.g., `search:tenant_disney:query_hash`). This prevents key collisions and enables per-tenant cache management.
 
 ---
+## 6. API Design
+
+The API follows **RESTful principles** with clear, resource-oriented URLs. All requests use **JSON** for payloads and standard HTTP status codes for responses.
+
+### 6.1 Design Principles
+
+- **Resource-oriented URLs**: `/documents/{id}` instead of `/getDocument`
+- **Standard HTTP verbs**: GET (read), POST (create), DELETE (remove)
+- **JSON everywhere**: Request bodies and responses use JSON
+- **Header-based multi-tenancy**: `X-Tenant-ID` header identifies the tenant
+- **Explicit error responses**: Structured error payloads with codes and messages
+- **Versioned APIs**: All endpoints prefixed with `/v1/` for backward compatibility
+- **Idempotent operations**: DELETE and PUT are safely repeatable
+
+### 6.2 Authentication & Multi-Tenancy
+
+Every request must include:
+```
+Authorization: Bearer <API_KEY>
+X-Tenant-ID: <TENANT_UUID>
+```
+
+The API validates the API key against the tenant, ensuring:
+- The key exists and is active
+- The key belongs to the tenant specified in `X-Tenant-ID`
+- The tenant has not exceeded its rate limit
+
+### 6.3 API Endpoints
+
+#### 6.3.1 Index a Document
+
+**Endpoint:** `POST /v1/documents`
+
+**Purpose:** Submit a document for indexing. Returns immediately with a document ID; actual indexing happens asynchronously.
+
+**Request:**
+```http
+POST /v1/documents
+Authorization: Bearer sk_live_abc123
+X-Tenant-ID: tenant_disney_corp
+Content-Type: application/json
+
+{
+  "title": "Marvel Studios Q3 2024 Contract",
+  "content": "This agreement between Marvel Studios and...",
+  "metadata": {
+    "author": "Legal Team",
+    "tags": ["contract", "marvel", "2024"],
+    "department": "Legal"
+  }
+}
+```
+
+**Response (202 Accepted):**
+```json
+{
+  "document_id": "doc_7f3e9b2a-4c1d-4a8e-9f2b-1c3d5e7f9a0b",
+  "status": "pending",
+  "message": "Document accepted for indexing",
+  "estimated_indexing_time_seconds": 3
+}
+```
+
+**Error Responses:**
+- `400 Bad Request` — Missing required fields
+- `401 Unauthorized` — Invalid API key
+- `403 Forbidden` — Tenant not allowed
+- `413 Payload Too Large` — Document > 10MB
+- `429 Too Many Requests` — Rate limit exceeded
+
+---
+
+#### 6.3.2 Search Documents
+
+**Endpoint:** `GET /v1/search`
+
+**Purpose:** Full-text search across the tenant's documents with relevance ranking.
+
+**Request:**
+```http
+GET /v1/search?q=marvel+contract&limit=10&offset=0
+Authorization: Bearer sk_live_abc123
+X-Tenant-ID: tenant_disney_corp
+```
+
+**Query Parameters:**
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `q` | string | Yes | — | Search query |
+| `limit` | int | No | 10 | Max results (max 100) |
+| `offset` | int | No | 0 | Pagination offset |
+| `sort` | string | No | `relevance` | `relevance`, `date_desc`, `date_asc` |
+| `filter` | string | No | — | JSON filter (e.g., `{"tags":["contract"]}`) |
+
+**Response (200 OK):**
+```json
+{
+  "total": 42,
+  "limit": 10,
+  "offset": 0,
+  "took_ms": 87,
+  "cached": false,
+  "results": [
+    {
+      "document_id": "doc_7f3e9b2a-4c1d-4a8e-9f2b-1c3d5e7f9a0b",
+      "title": "Marvel Studios Q3 2024 Contract",
+      "snippet": "This agreement between <em>Marvel</em> Studios and Disney Corp regarding the <em>contract</em>...",
+      "score": 8.42,
+      "metadata": {
+        "author": "Legal Team",
+        "tags": ["contract", "marvel", "2024"]
+      },
+      "created_at": "2024-09-15T10:30:00Z"
+    }
+  ]
+}
+```
+
+**Error Responses:**
+- `400 Bad Request` — Invalid query syntax
+- `401 Unauthorized` — Invalid API key
+- `429 Too Many Requests` — Rate limit exceeded
+
+---
+
+#### 6.3.3 Retrieve Document Details
+
+**Endpoint:** `GET /v1/documents/{document_id}`
+
+**Purpose:** Fetch full details of a specific document.
+
+**Request:**
+```http
+GET /v1/documents/doc_7f3e9b2a-4c1d-4a8e-9f2b-1c3d5e7f9a0b
+Authorization: Bearer sk_live_abc123
+X-Tenant-ID: tenant_disney_corp
+```
+
+**Response (200 OK):**
+```json
+{
+  "document_id": "doc_7f3e9b2a-4c1d-4a8e-9f2b-1c3d5e7f9a0b",
+  "title": "Marvel Studios Q3 2024 Contract",
+  "content": "This agreement between Marvel Studios and Disney Corp...",
+  "metadata": {
+    "author": "Legal Team",
+    "tags": ["contract", "marvel", "2024"],
+    "department": "Legal"
+  },
+  "status": "indexed",
+  "created_at": "2024-09-15T10:30:00Z",
+  "indexed_at": "2024-09-15T10:30:03Z"
+}
+```
+
+**Error Responses:**
+- `404 Not Found` — Document doesn't exist or belongs to different tenant
+
+---
+
+#### 6.3.4 Delete a Document
+
+**Endpoint:** `DELETE /v1/documents/{document_id}`
+
+**Purpose:** Permanently remove a document from search and storage.
+
+**Request:**
+```http
+DELETE /v1/documents/doc_7f3e9b2a-4c1d-4a8e-9f2b-1c3d5e7f9a0b
+Authorization: Bearer sk_live_abc123
+X-Tenant-ID: tenant_disney_corp
+```
+
+**Response (204 No Content):**
+```
+(empty body)
+```
+
+**Design Note:** Deletion is soft-delete first (mark as deleted in PostgreSQL, remove from ES), then hard-delete via a background cleanup job after 30 days. This allows for accidental deletion recovery.
+
+**Error Responses:**
+- `404 Not Found` — Document doesn't exist
+- `403 Forbidden` — Document belongs to different tenant
+
+---
+
+#### 6.3.5 Health Check Endpoints
+
+**Endpoint:** `GET /health`
+
+**Purpose:** Overall system health with dependency status.
+
+**Response (200 OK):**
+```json
+{
+  "status": "healthy",
+  "version": "1.0.0",
+  "timestamp": "2026-07-01T15:30:00Z",
+  "dependencies": {
+    "postgresql": {"status": "healthy", "latency_ms": 3},
+    "elasticsearch": {"status": "healthy", "latency_ms": 12, "cluster_status": "green"},
+    "redis": {"status": "healthy", "latency_ms": 1},
+    "rabbitmq": {"status": "healthy", "queue_depth": 42}
+  }
+}
+```
+
+**Response (503 Service Unavailable):**
+```json
+{
+  "status": "degraded",
+  "dependencies": {
+    "elasticsearch": {"status": "unhealthy", "error": "Connection timeout"}
+  }
+}
+```
+
+**Endpoint:** `GET /health/live` — Kubernetes liveness probe (is the process running?)  
+**Endpoint:** `GET /health/ready` — Kubernetes readiness probe (can it serve traffic?)
+
+### 6.4 Error Response Format
+
+All errors follow a consistent structure:
+
+```json
+{
+  "error": {
+    "code": "RATE_LIMIT_EXCEEDED",
+    "message": "You have exceeded 100 requests per minute",
+    "details": {
+      "limit": 100,
+      "reset_at": "2026-07-01T15:31:00Z"
+    },
+    "request_id": "req_a1b2c3d4"
+  }
+}
+```
+
+**Why this format?**
+- **`code`**: Machine-readable, stable across versions
+- **`message`**: Human-readable for debugging
+- **`details`**: Context-specific info
+- **`request_id`**: Enables tracing in logs (correlate with server-side)
+
+### 6.5 Rate Limiting
+
+Rate limits are enforced **per tenant**, not per API key. This prevents a single tenant from monopolizing capacity.
+
+**Default limits by tier:**
+| Tier | Requests/min | Documents |
+|---|---|---|
+| Free | 60 | 10,000 |
+| Pro | 600 | 100,000 |
+| Enterprise | 6,000 | 10,000,000 |
+
+**Rate limit headers** (returned on every response):
+```
+X-RateLimit-Limit: 600
+X-RateLimit-Remaining: 542
+X-RateLimit-Reset: 1719852600
+```
+
+---
