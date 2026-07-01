@@ -841,3 +841,241 @@ Low hit ratio indicates:
 - **Net benefit: ~$1500/month + better user experience**
 
 ---
+## 8. Message Queue Usage
+
+Asynchronous processing via message queues is critical for maintaining fast API response times while performing potentially slow operations like document indexing. The system uses **RabbitMQ** as the message broker.
+
+### 8.1 Why Async Processing?
+
+**Problem:** Indexing a document takes 1-5 seconds (text extraction, tokenization, index update). If the API blocks on this, we can't meet our sub-500ms latency requirement.
+
+**Solution:** Decouple accepting the document from indexing it:
+1. API accepts document → publishes message → returns 202 Accepted (< 50ms)
+2. Worker consumes message → indexes document (1-5 seconds)
+3. Client polls status endpoint or receives webhook when done
+
+**Benefits:**
+- **Fast responses** — API doesn't wait for slow operations
+- **Load leveling** — bursts of uploads don't overwhelm ES
+- **Retry logic** — failed operations retry automatically
+- **Horizontal scaling** — add more workers as load grows
+- **Isolation** — indexing failures don't affect search availability
+
+### 8.2 Why RabbitMQ?
+
+**Chosen because:**
+- **Mature and battle-tested** — used by NASA, Instagram, Reddit
+- **Rich routing** — exchanges, routing keys, bindings for flexible patterns
+- **Strong delivery guarantees** — supports at-least-once with acknowledgments
+- **Priority queues** — enterprise tenants can get faster processing
+- **Dead letter queues** — automatic handling of failed messages
+- **Cluster support** — high availability with mirrored queues
+
+**Alternatives considered:**
+
+| Alternative | Why We Didn't Choose It |
+|---|---|
+| **Apache Kafka** | Overkill for our throughput (10K msg/sec); optimized for event streaming, not task queues |
+| **AWS SQS** | Vendor lock-in, limited routing capabilities |
+| **Redis Streams** | Newer, less mature; we're already using Redis for caching |
+| **Celery + Redis** | Popular in Python, but weaker delivery guarantees than RabbitMQ |
+
+### 8.3 Queue Architecture
+
+```mermaid
+graph LR
+    API[FastAPI] -->|publish| EX[Exchange<br/>documents.topic]
+    
+    EX -->|routing key: index| IQ[indexing.queue]
+    EX -->|routing key: delete| DQ[deletion.queue]
+    EX -->|routing key: reindex| RQ[reindex.queue]
+    
+    IQ --> IW1[Indexing Worker 1]
+    IQ --> IW2[Indexing Worker 2]
+    IQ --> IW3[Indexing Worker N]
+    
+    DQ --> DW1[Deletion Worker]
+    RQ --> RW1[Reindex Worker]
+    
+    IW1 -.->|failure| DLQ[Dead Letter Queue]
+    IW2 -.->|failure| DLQ
+    IW3 -.->|failure| DLQ
+```
+
+### 8.4 Queue Definitions
+
+| Queue | Purpose | Priority Support | Max Retries |
+|---|---|---|---|
+| `documents.indexing` | Index new documents | Yes (0-9) | 3 |
+| `documents.deletion` | Remove from ES + PG | No | 3 |
+| `documents.reindex` | Rebuild index for schema changes | No | 5 |
+| `notifications.webhooks` | Send webhook events to clients | No | 5 |
+| `documents.dlq` | Dead letter queue for failed messages | N/A | N/A |
+
+### 8.5 Message Format
+
+All messages use a consistent JSON schema:
+
+```json
+{
+  "message_id": "msg_a1b2c3d4",
+  "message_type": "document.index",
+  "version": "1.0",
+  "timestamp": "2026-07-01T15:30:00Z",
+  "tenant_id": "tenant_disney_corp",
+  "correlation_id": "req_x9y8z7w6",
+  "payload": {
+    "document_id": "doc_7f3e9b2a",
+    "content": "...",
+    "metadata": {}
+  },
+  "retry_count": 0,
+  "priority": 5
+}
+```
+
+**Field explanations:**
+- **`message_id`**: Unique identifier for deduplication
+- **`correlation_id`**: Traces back to the original API request
+- **`retry_count`**: Incremented on each retry
+- **`priority`**: 0-9, higher = processed first
+
+### 8.6 Delivery Guarantees
+
+The system uses **at-least-once delivery**:
+
+1. **Producer confirms** — API waits for RabbitMQ to acknowledge message received
+2. **Worker acknowledgment** — Worker only ACKs after successful processing
+3. **Automatic requeue** — If worker crashes mid-processing, message returns to queue
+4. **Idempotent consumers** — Duplicate messages produce the same result
+
+**Why not exactly-once?**
+Exactly-once delivery is nearly impossible in distributed systems (would require distributed transactions across RabbitMQ, ES, and PG). At-least-once + idempotency achieves the same effect with much less complexity.
+
+### 8.7 Idempotency Implementation
+
+Workers use the `message_id` and `document_id` to ensure idempotency:
+
+```python
+def process_indexing_message(message):
+    doc_id = message["payload"]["document_id"]
+    message_id = message["message_id"]
+    
+    # Check if already processed (using Redis for fast lookup)
+    if redis.exists(f"processed:{message_id}"):
+        logger.info(f"Message {message_id} already processed, skipping")
+        return  # Idempotent skip
+    
+    # Check if document already indexed
+    existing = elasticsearch.get(doc_id, ignore=[404])
+    if existing and existing["_source"]["version"] >= message["payload"]["version"]:
+        logger.info(f"Doc {doc_id} already indexed with same or newer version")
+        return  # Idempotent skip
+    
+    # Process the document
+    index_document(message["payload"])
+    
+    # Mark as processed
+    redis.setex(f"processed:{message_id}", 86400, "1")  # 24h TTL
+```
+
+### 8.8 Retry and Dead Letter Queue
+
+**Retry Strategy:**
+- Automatic retries with **exponential backoff**: 1s, 2s, 4s, 8s
+- Max 3 retries for indexing (fast fail)
+- Max 5 retries for webhooks (external systems may be slow)
+
+**Dead Letter Queue (DLQ):**
+After max retries, messages move to `documents.dlq` for:
+- Manual investigation by ops team
+- Automated alerting (PagerDuty)
+- Potential replay after fixing the root cause
+
+**Example DLQ Alert:**
+```json
+{
+  "original_message_id": "msg_a1b2c3d4",
+  "tenant_id": "tenant_disney_corp",
+  "failure_reason": "Elasticsearch cluster unreachable",
+  "failed_after_retries": 3,
+  "last_error": "ConnectionRefusedError: [Errno 111]",
+  "timestamp": "2026-07-01T15:32:15Z"
+}
+```
+
+### 8.9 Priority Queuing
+
+Enterprise tenants get faster processing via **priority queuing**:
+
+| Tenant Tier | Priority | Impact |
+|---|---|---|
+| Enterprise | 9 (highest) | Processed within 1s |
+| Pro | 5 (medium) | Processed within 5s |
+| Free | 1 (lowest) | Processed within 30s |
+
+**Implementation:**
+```python
+message["priority"] = get_tenant_priority(tenant_id)
+channel.basic_publish(
+    exchange='documents.topic',
+    routing_key='index',
+    properties=pika.BasicProperties(priority=message["priority"]),
+    body=json.dumps(message)
+)
+```
+
+**Why this matters:** Enterprise customers pay 10x more — their documents should be searchable faster. Priority queuing enforces this SLA at the infrastructure level.
+
+### 8.10 Backpressure and Flow Control
+
+**Problem:** What if uploads exceed indexing capacity? Queue grows unbounded → RabbitMQ runs out of memory.
+
+**Solutions:**
+
+1. **Queue Length Limits**
+```
+   documents.indexing max_length: 1,000,000
+```
+   When full, RabbitMQ rejects new messages → API returns 503 to clients.
+
+2. **Consumer Prefetch**
+```python
+   channel.basic_qos(prefetch_count=10)
+```
+   Workers only fetch 10 messages at a time → don't overwhelm memory.
+
+3. **Auto-Scaling Workers**
+   Kubernetes HPA scales workers based on queue depth:
+```yaml
+   metrics:
+     - type: External
+       external:
+         metric:
+           name: rabbitmq_queue_depth
+         target:
+           type: Value
+           averageValue: "1000"
+```
+   If avg queue depth > 1000, spin up more workers.
+
+### 8.11 Monitoring and Alerting
+
+**Key metrics:**
+
+| Metric | Target | Alert Threshold |
+|---|---|---|
+| Queue depth (indexing) | < 1,000 | > 10,000 |
+| Message age (p99) | < 5 seconds | > 60 seconds |
+| DLQ message count | 0 | > 10 |
+| Worker throughput | > 100 msg/sec | < 10 msg/sec |
+| Retry rate | < 1% | > 10% |
+| Consumer count | ≥ 3 | < 2 |
+
+**Alerts:**
+- **CRITICAL**: DLQ growing (something is broken)
+- **HIGH**: Queue depth > 10K (indexing backlog)
+- **MEDIUM**: Retry rate spike (transient issues)
+- **LOW**: Slow message processing (capacity planning)
+
+---
