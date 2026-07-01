@@ -1079,3 +1079,305 @@ channel.basic_publish(
 - **LOW**: Slow message processing (capacity planning)
 
 ---
+## 9. Multi-Tenancy Architecture
+
+Multi-tenancy is a **first-class architectural concern** in this system. Every design decision considers tenant isolation, fairness, and security.
+
+### 9.1 Multi-Tenancy Model
+
+The system uses a **hybrid multi-tenancy approach** — different isolation models for different data types, optimized for each use case:
+
+| Data Layer | Isolation Model | Rationale |
+|---|---|---|
+| **Elasticsearch** | Index per tenant | Strong isolation, custom mappings possible |
+| **PostgreSQL** | Shared schema with `tenant_id` + Row-Level Security | Cost-efficient, database-enforced isolation |
+| **Redis** | Shared instance with namespaced keys | Fast lookups, tenant_id prefix in every key |
+| **RabbitMQ** | Shared queues with tenant_id in message payload | Efficient, priority queuing by tenant tier |
+
+This is called **polyglot multi-tenancy** — using the right isolation model for each data type.
+
+### 9.2 Elasticsearch Multi-Tenancy
+
+**Strategy: Index per Tenant**
+
+Each tenant gets a dedicated Elasticsearch index:
+```
+tenant_disney_docs
+tenant_netflix_docs
+tenant_spotify_docs
+```
+
+**Benefits:**
+- **Strict physical isolation** — impossible to cross-query indices
+- **Custom mappings per tenant** — enterprise tenants can define custom fields
+- **Independent scaling** — hot tenants get more shards
+- **Easy tenant deletion** — delete the entire index (GDPR compliance)
+- **Backup granularity** — snapshot/restore individual tenants
+
+**Handling scale:**
+
+| Tenant Size | Strategy |
+|---|---|
+| Small (< 10K docs) | Grouped in shared indices (`shared_index_1`, etc.) with `tenant_id` filter |
+| Medium (10K - 1M docs) | Dedicated index with 3 shards, 2 replicas |
+| Large (1M - 10M docs) | Dedicated index with 6 shards, 2 replicas |
+| Enterprise (> 10M docs) | Dedicated index + dedicated ES nodes |
+
+**Why not always dedicated?** Elasticsearch has overhead per index (~50MB). With 10K small tenants, we'd waste 500GB just on index metadata.
+
+**Search query example:**
+```python
+# Tenant-scoped search — index name is the security boundary
+def search(tenant_id: str, query: str):
+    index_name = f"tenant_{tenant_id}_docs"
+    response = es.search(
+        index=index_name,  # ONLY this tenant's index
+        body={"query": {"match": {"content": query}}}
+    )
+    return response
+```
+
+### 9.3 PostgreSQL Multi-Tenancy
+
+**Strategy: Shared Schema with Row-Level Security (RLS)**
+
+All tenants share the same tables, with a `tenant_id` column on every table:
+
+```sql
+CREATE TABLE documents (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+    title VARCHAR(500),
+    file_path TEXT,
+    status VARCHAR(20),
+    created_at TIMESTAMP,
+    metadata JSONB
+);
+
+-- Compound index for fast tenant-scoped queries
+CREATE INDEX idx_tenant_documents ON documents (tenant_id, created_at DESC);
+```
+
+**Row-Level Security (RLS) Policies:**
+
+```sql
+-- Enable RLS on the table
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+
+-- Create policy that filters by current tenant
+CREATE POLICY tenant_isolation ON documents
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+-- Application sets tenant context per connection
+SET app.current_tenant_id = 'disney_corp_uuid';
+
+-- Now ALL queries are automatically filtered
+SELECT * FROM documents;  -- Only returns Disney's documents
+```
+
+**Why RLS is critical:**
+- **Defense in depth** — even if application code forgets to filter, DB protects data
+- **Zero-trust design** — never trust application to enforce security
+- **Audit compliance** — easy to prove data isolation to auditors
+
+**Trade-off:** Slight performance overhead (5-10%) vs pure application-level filtering. Worth it for the security guarantee.
+
+### 9.4 Redis Multi-Tenancy
+
+**Strategy: Namespaced Keys**
+
+All Redis keys are prefixed with tenant_id:
+
+```
+v1:search:tenant_disney:query_hash_abc123
+v1:doc:tenant_netflix:doc_id_xyz789
+v1:ratelimit:tenant_spotify:2026-07-01T15:30
+```
+
+**Benefits:**
+- No accidental cross-tenant reads
+- Easy per-tenant cache clearing (`SCAN` + `DEL` on pattern)
+- Simple to reason about
+
+**Access enforcement:**
+```python
+def get_cached_search(tenant_id: str, query_hash: str):
+    key = f"v1:search:{tenant_id}:{query_hash}"
+    return redis.get(key)  # tenant_id in key = isolation
+
+def clear_tenant_cache(tenant_id: str):
+    # Delete all keys for this tenant
+    for key in redis.scan_iter(match=f"v1:*:{tenant_id}:*"):
+        redis.delete(key)
+```
+
+**Trade-off:** Not physical isolation (all in same Redis). For enterprise tenants requiring stronger isolation, we can spin up dedicated Redis instances.
+
+### 9.5 RabbitMQ Multi-Tenancy
+
+**Strategy: Shared Queues with Priority by Tenant Tier**
+
+All tenants share the same queues, but each message includes `tenant_id` and priority:
+
+```json
+{
+  "message_id": "msg_abc123",
+  "tenant_id": "tenant_disney_corp",
+  "priority": 9,  // Enterprise tenant
+  "payload": { ... }
+}
+```
+
+**Enterprise tenants get:**
+- Higher priority (processed first)
+- Dedicated worker pool (optional, for very large customers)
+- Faster processing SLA (< 1 second vs 30 seconds for free tier)
+
+### 9.6 Tenant Onboarding Flow
+
+When a new tenant signs up, this happens automatically:
+
+```mermaid
+sequenceDiagram
+    participant Admin as Admin/API
+    participant PG as PostgreSQL
+    participant ES as Elasticsearch
+    participant Redis as Redis
+    participant MQ as RabbitMQ
+
+    Admin->>PG: INSERT INTO tenants (name, tier, ...)
+    PG-->>Admin: tenant_id
+    Admin->>ES: PUT /tenant_{tenant_id}_docs<br/>(create index with mapping)
+    ES-->>Admin: OK
+    Admin->>Redis: SET tenant:{tenant_id}:config
+    Redis-->>Admin: OK
+    Admin->>MQ: Configure priority for tenant
+    MQ-->>Admin: OK
+    Admin-->>Admin: Tenant ready in ~2 seconds
+```
+
+**Fast onboarding:** New tenants can start uploading within 2 seconds of signup.
+
+### 9.7 Noisy Neighbor Prevention
+
+Multi-tenant systems suffer from the **noisy neighbor problem** — one tenant's heavy usage degrades service for others. Our mitigations:
+
+#### 1. **Per-Tenant Rate Limiting**
+```
+Free: 60 req/min
+Pro: 600 req/min
+Enterprise: 6,000 req/min
+```
+Enforced via Redis counters with sliding window.
+
+#### 2. **Query Cost Estimation**
+Before executing expensive searches, estimate cost:
+```python
+def estimate_query_cost(query: str, tenant_id: str) -> int:
+    complexity = 1
+    if "*" in query or "?" in query: complexity *= 5  # Wildcards
+    if query.count("AND") > 5: complexity *= 2  # Complex logic
+    if get_tenant_doc_count(tenant_id) > 1_000_000: complexity *= 2
+    return complexity
+
+# Reject if too expensive
+if estimate_query_cost(query, tenant_id) > tenant_quota:
+    raise QueryTooExpensiveError()
+```
+
+#### 3. **Circuit Breakers per Tenant**
+If a tenant's queries fail repeatedly, temporarily throttle them:
+```python
+if tenant_error_rate(tenant_id, last_5min) > 0.5:
+    circuit_breaker.open(tenant_id)  # Return 503 for 60 seconds
+```
+
+#### 4. **Dedicated Resources for Enterprise**
+Enterprise tenants can request:
+- Dedicated Elasticsearch nodes
+- Dedicated indexing workers
+- Isolated Redis instance
+
+**Cost:** Higher pricing tier, but guarantees performance SLA.
+
+### 9.8 Tenant Data Deletion (GDPR/Compliance)
+
+When a tenant requests deletion (GDPR "right to be forgotten"):
+
+```mermaid
+graph TD
+    Start[Deletion Request] --> Confirm[Confirm with Admin]
+    Confirm --> Backup[Create Final Backup]
+    Backup --> DeleteES[Delete ES Index]
+    Backup --> DeletePG[Cascade DELETE in PG]
+    Backup --> DeleteCache[Clear Redis Namespace]
+    Backup --> DeleteQueues[Purge Queue Messages]
+    DeleteES --> Audit[Log to Audit Trail]
+    DeletePG --> Audit
+    DeleteCache --> Audit
+    DeleteQueues --> Audit
+    Audit --> Certify[Generate Deletion Certificate]
+```
+
+**Timeline:**
+- Immediate: All data becomes inaccessible
+- 30 days: Final backup retained for accidental recovery
+- 30 days + 1: Complete purge, deletion certificate issued
+
+### 9.9 Cross-Tenant Analytics
+
+We do **anonymized cross-tenant analytics** to improve the product:
+
+**Allowed:**
+- Aggregate metrics (total searches, avg latency)
+- Popular query patterns (fully anonymized)
+- Feature usage statistics
+
+**Not allowed:**
+- Reading individual tenant's documents
+- Cross-tenant query patterns
+- PII from any tenant
+
+**Implementation:**
+```python
+def collect_analytics(tenant_id: str, event: str, metadata: dict):
+    # Strip PII, hash tenant_id
+    anonymized = {
+        "tenant_hash": hashlib.sha256(tenant_id.encode()).hexdigest()[:8],
+        "event": event,
+        "metadata": strip_pii(metadata)
+    }
+    analytics_pipeline.send(anonymized)
+```
+
+### 9.10 Multi-Tenancy Security Checklist
+
+Every code path that touches tenant data must pass this checklist:
+
+- ✅ tenant_id required in function signature
+- ✅ Elasticsearch index scoped to tenant
+- ✅ PostgreSQL RLS active for connection
+- ✅ Redis keys namespaced with tenant_id
+- ✅ Logs include tenant_id for audit
+- ✅ Cache keys include tenant_id
+- ✅ Rate limits applied per tenant
+- ✅ Error messages don't leak other tenants' data
+- ✅ Unit tests verify cross-tenant isolation
+
+**Automated test example:**
+```python
+def test_tenant_isolation():
+    # Create documents for two tenants
+    doc_a = upload_document(tenant="tenant_a", content="secret A")
+    doc_b = upload_document(tenant="tenant_b", content="secret B")
+    
+    # Tenant A should NEVER see Tenant B's document
+    results = search(tenant="tenant_a", query="secret")
+    assert doc_b.id not in [r.id for r in results]
+    
+    # Even direct access should fail
+    with pytest.raises(NotFoundError):
+        get_document(tenant="tenant_a", doc_id=doc_b.id)
+```
+
+---
