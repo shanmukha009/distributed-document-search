@@ -151,3 +151,95 @@ Write path: `API → RabbitMQ → Worker → Elasticsearch + PostgreSQL` (async,
 If Redis crashes, the system falls back to Elasticsearch (slower but functional). If RabbitMQ crashes, uploads queue up but existing searches continue.
 
 ---
+## 4. Data Flow Diagrams
+
+The system has two primary data flows: **indexing** (write path) and **searching** (read path). Each is optimized differently — indexing prioritizes throughput via async processing, while searching prioritizes latency via caching.
+
+### 4.1 Indexing Flow (Document Upload)
+
+When a client uploads a document, the request is acknowledged immediately, and actual indexing happens asynchronously in the background.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant LB as Nginx
+    participant API as FastAPI
+    participant PG as PostgreSQL
+    participant MQ as RabbitMQ
+    participant W as Worker
+    participant ES as Elasticsearch
+
+    C->>LB: POST /documents (doc, tenant_id)
+    LB->>API: Forward request
+    API->>API: Validate request + auth
+    API->>PG: Insert metadata (status=pending)
+    PG-->>API: OK
+    API->>MQ: Publish indexing message
+    MQ-->>API: ACK
+    API-->>C: 202 Accepted (doc_id)
+
+    Note over W,ES: Async processing
+    W->>MQ: Consume message
+    MQ-->>W: Document data
+    W->>W: Process (extract, tokenize)
+    W->>ES: Index document (tenant-scoped)
+    ES-->>W: Indexed
+    W->>PG: Update status=indexed
+    PG-->>W: OK
+```
+
+**Design Rationale:**
+- **Async processing** decouples upload from indexing → fast client response (<50ms)
+- **PostgreSQL first** ensures we never lose a document even if RabbitMQ fails
+- **Worker retries** handle transient failures (e.g., ES node restart)
+- **Status tracking** allows clients to poll or subscribe to indexing completion
+
+**Trade-off:** Documents are not immediately searchable (eventual consistency). Typical delay: 1–5 seconds. For our use case (enterprise document search), this is acceptable.
+
+---
+
+### 4.2 Search Flow (Query Documents)
+
+Search requests follow the **cache-aside pattern** — check cache first, fall back to Elasticsearch, then populate cache.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant LB as Nginx
+    participant API as FastAPI
+    participant R as Redis
+    participant ES as Elasticsearch
+
+    C->>LB: GET /search?q=marvel&tenant=disney
+    LB->>API: Forward request
+    API->>API: Validate tenant + query
+    API->>R: Check cache (key: tenant:query_hash)
+    
+    alt Cache HIT
+        R-->>API: Cached results
+        API-->>C: 200 OK (results, 1ms)
+    else Cache MISS
+        R-->>API: null
+        API->>ES: Search (index=tenant_disney_docs)
+        ES-->>API: Ranked results (~100ms)
+        API->>R: Set cache (TTL=60s)
+        R-->>API: ACK
+        API-->>C: 200 OK (results)
+    end
+```
+
+**Design Rationale:**
+- **Cache-aside pattern** — application controls cache logic, avoids stale writes
+- **TTL of 60 seconds** — balances freshness vs cache hit ratio
+- **Cache key includes tenant_id** — prevents cross-tenant data leakage
+- **Query hash used as cache key** — normalizes similar queries (e.g., "MARVEL" and "marvel")
+
+**Performance Characteristics:**
+| Path | Latency (p95) | Frequency |
+|---|---|---|
+| Cache HIT | ~1ms | 70-80% of queries |
+| Cache MISS | ~150ms | 20-30% of queries |
+
+With a 70% cache hit ratio, the overall p95 latency stays well under 500ms.
+
+---
